@@ -1,0 +1,62 @@
+name: ci
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - java: 21
+          architecture: 'x64'
+          os: windows-latest
+          arch: x64
+          runner: windows-latest
+          expander_leg: windows-latest-21-x64
+    name: Build with JDK ${{ matrix.java }} on ${{ matrix.architecture }} [${{ 
+      matrix.expander_leg }}]
+    steps:
+    - uses: actions/checkout@v7
+    - name: Setup JDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.java }}
+        architecture: ${{ matrix.architecture }}
+        cache: 'maven'
+
+    - name: Build with Maven
+      run: ./mvnw -B package
+
+      # pivovarit/verify-jar-action runs its script through an unquoted Windows path in bash, so
+      # the backslashes get stripped and the script can't be found. This step does the same check
+      # (every class must be loadable on Java 21, class file major version 65 or lower) and works
+      # the same way on every runner.
+    - name: Verify jar
+      shell: bash
+      run: |
+        set -euo pipefail
+        max_major=65 # Java 21
+        found=0
+        for jar in vavr/target/*.jar; do
+          abs_jar="$(pwd)/$jar"
+          work="$(mktemp -d)"
+          (cd "$work" && jar xf "$abs_jar")
+          while IFS= read -r -d '' cls; do
+            found=1
+            major=$(od -An -j6 -N2 -tu1 "$cls" | awk '{print $1*256+$2}')
+            if [ "$major" -gt "$max_major" ]; then
+              echo "::error::$jar: ${cls#$work/} has class file major version $major (> $max_major, Java 21)"
+              exit 1
+            fi
+          done < <(find "$work" -name '*.class' -not -path '*/META-INF/versions/*' -print0)
+          rm -rf "$work"
+        done
+        if [ "$found" -eq 0 ]; then
+          echo "::error::no class files found in vavr/target/*.jar"
+          exit 1
+        fi
+        echo "All classes in vavr/target/*.jar target Java 21 or lower"
+
+    timeout-minutes: 150
