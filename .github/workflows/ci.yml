@@ -1,0 +1,78 @@
+name: ci
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - java: 21
+          architecture: 'x64'
+          os: macos-latest
+          arch: arm64
+          runner: macos-latest
+          expander_leg: macos-latest-21-arm64
+    name: Build with JDK ${{ matrix.java }} on ${{ matrix.architecture }} [${{ 
+      matrix.expander_leg }}]
+    steps:
+    - uses: actions/checkout@v7
+    - name: Setup JDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.java }}
+        architecture: ${{ matrix.architecture }}
+        cache: 'maven'
+
+    - name: Build with Maven
+      run: ./mvnw -B package
+
+    - name: Setup JDK 21 for jar verification
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+        architecture: ${{ matrix.arch }}
+
+      # Portable replacement for pivovarit/verify-jar-action, whose script relies on
+      # bash 4 `mapfile` and breaks on macOS (bash 3.2). Checks that every built jar
+      # opens with JDK 21 and contains no class files newer than Java 21 (major 65).
+    - name: Verify jar
+      shell: bash
+      run: |
+        set -euo pipefail
+        max_major=65
+        found=0
+        for jarfile in vavr/target/*.jar; do
+          [ -e "$jarfile" ] || continue
+          case "$jarfile" in
+            *-sources.jar|*-javadoc.jar) continue ;;
+          esac
+          found=1
+          echo "Verifying $jarfile"
+          jar tf "$jarfile" > /dev/null
+          tmp="$(mktemp -d)"
+          abs_jar="$(cd "$(dirname "$jarfile")" && pwd)/$(basename "$jarfile")"
+          (cd "$tmp" && jar xf "$abs_jar")
+          bad=0
+          while IFS= read -r cls; do
+            major=$(od -An -j6 -N2 -tu1 "$cls" | awk '{print $1*256+$2}')
+            if [ "$major" -gt "$max_major" ]; then
+              echo "::error::$cls has class file major version $major (> $max_major)"
+              bad=1
+            fi
+          done < <(find "$tmp" -name '*.class' -not -path '*/META-INF/versions/*')
+          rm -rf "$tmp"
+          if [ "$bad" -ne 0 ]; then
+            exit 1
+          fi
+        done
+        if [ "$found" -eq 0 ]; then
+          echo "::error::No jars found in vavr/target"
+          exit 1
+        fi
+        echo "All jars verified for Java 21"
+
+    timeout-minutes: 150
