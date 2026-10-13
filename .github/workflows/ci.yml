@@ -1,0 +1,106 @@
+name: ci
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - java: 26
+          os: macos-latest
+          arch: arm64
+          runner: macos-latest
+          expander_leg: macos-latest-26-arm64
+    name: Build with JDK ${{ matrix.java }} on ${{ matrix.os }} ${{ matrix.arch 
+      }} [${{ matrix.expander_leg }}]
+    steps:
+    - uses: actions/checkout@v7
+    - name: Setup JDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.java }}
+        architecture: ${{ matrix.jdk_arch || matrix.arch }}
+        cache: 'maven'
+
+    - name: Build with Maven
+      run: ./mvnw -B package
+
+    - name: Setup JDK for jar verification
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+      # Same check as pivovarit/verify-jar-action, run inline: that action calls
+      # its verify.sh through an unquoted Windows path, so bash drops the
+      # backslashes and the script is never found on Windows runners.
+    - name: Verify jar
+      shell: bash
+      run: |
+        cat > vavr/target/VerifyJar.java <<'EOF'
+        import java.io.DataInputStream;
+        import java.nio.file.Files;
+        import java.nio.file.Path;
+        import java.util.Collections;
+        import java.util.List;
+        import java.util.jar.JarEntry;
+        import java.util.jar.JarFile;
+        import java.util.stream.Stream;
+
+        public class VerifyJar {
+            public static void main(String[] args) throws Exception {
+                Path dir = Path.of(args[0]);
+                int javaVersion = Integer.parseInt(args[1]);
+                int maxMajor = 44 + javaVersion;
+                List<Path> jars;
+                try (Stream<Path> files = Files.list(dir)) {
+                    jars = files
+                        .filter(p -> p.getFileName().toString().endsWith(".jar"))
+                        .filter(p -> !p.getFileName().toString().endsWith("-sources.jar"))
+                        .filter(p -> !p.getFileName().toString().endsWith("-javadoc.jar"))
+                        .toList();
+                }
+                if (jars.isEmpty()) {
+                    System.err.println("No jar found in " + dir);
+                    System.exit(1);
+                }
+                int bad = 0;
+                for (Path jar : jars) {
+                    int classes = 0;
+                    try (JarFile jarFile = new JarFile(jar.toFile())) {
+                        for (JarEntry entry : Collections.list(jarFile.entries())) {
+                            String name = entry.getName();
+                            if (!name.endsWith(".class") || name.startsWith("META-INF/versions/")) {
+                                continue;
+                            }
+                            try (DataInputStream in = new DataInputStream(jarFile.getInputStream(entry))) {
+                                if (in.readInt() != 0xCAFEBABE) {
+                                    System.err.println(jar.getFileName() + ": " + name + " is not a valid class file");
+                                    bad++;
+                                    continue;
+                                }
+                                in.readUnsignedShort();
+                                int major = in.readUnsignedShort();
+                                if (major > maxMajor) {
+                                    System.err.println(jar.getFileName() + ": " + name + " has class file version " + major
+                                        + ", newer than Java " + javaVersion + " (" + maxMajor + ")");
+                                    bad++;
+                                }
+                            }
+                            classes++;
+                        }
+                    }
+                    System.out.println(jar.getFileName() + ": checked " + classes + " classes against Java " + javaVersion);
+                }
+                if (bad > 0) {
+                    System.exit(1);
+                }
+            }
+        }
+        EOF
+        java vavr/target/VerifyJar.java vavr/target 21
+
+    timeout-minutes: 150
